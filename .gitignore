@@ -1,0 +1,12 @@
+# Teacher-provided corpus (large and reproducible)
+Archive/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and editor/OS files
+.venv/
+venv/
+.DS_Store
