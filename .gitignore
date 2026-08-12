@@ -4,6 +4,10 @@ Archive/
 # Python-generated files
 __pycache__/
 *.py[cod]
+*.pyd
+*.obj
+*.lib
+*.exp
 .pytest_cache/
 
 # Local environments and editor/OS files

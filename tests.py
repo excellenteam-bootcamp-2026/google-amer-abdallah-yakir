@@ -18,7 +18,7 @@ def main():
         if (
             record.source_text
             == "python-3.8.4-docs-text/c-api/arg.txt"
-            and record.offset == 332
+            and record.source_offset == 332
         ):
             known_example = record
 
@@ -30,7 +30,7 @@ def main():
         print(f"Original: {known_example.completed_sentence}")
         print(f"Normalized: {known_example.normalized_sentence}")
         print(f"Source: {known_example.source_text}")
-        print(f"Offset: {known_example.offset}")
+        print(f"Offset: {known_example.source_offset}")
     else:
         print("Known assignment example was not found.")
 

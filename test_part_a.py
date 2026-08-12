@@ -1,7 +1,6 @@
 import unittest
 
-from autocomplete_index import build_autocomplete_index_from_records
-from data_loader import SentenceRecord
+from data_loader import SentenceRecord, normalize_text
 from part_a import AutoCompleteSystem, best_match_score
 
 
@@ -9,9 +8,9 @@ def make_record(sentence_id, sentence, normalized=None, source="sample.txt"):
     return SentenceRecord(
         sentence_id=sentence_id,
         completed_sentence=sentence,
-        normalized_sentence=normalized or sentence.casefold(),
+        normalized_sentence=normalized or normalize_text(sentence),
         source_text=source,
-        offset=sentence_id,
+        source_offset=sentence_id,
     )
 
 
@@ -45,8 +44,7 @@ class CompletionTests(unittest.TestCase):
             make_record(4, "Delta beta", "delta beta"),
             make_record(5, "Charlie beta", "charlie beta"),
         ]
-        indexes = build_autocomplete_index_from_records(records)
-        system = AutoCompleteSystem(records, indexes)
+        system = AutoCompleteSystem.from_records(records)
 
         results = system.get_best_k_completions("BETA")
 
@@ -68,10 +66,9 @@ class CompletionTests(unittest.TestCase):
             completed_sentence="To be, or not to be.",
             normalized_sentence="to be or not to be",
             source_text="nested/quote.txt",
-            offset=7,
+            source_offset=7,
         )
-        indexes = build_autocomplete_index_from_records([record])
-        system = AutoCompleteSystem([record], indexes)
+        system = AutoCompleteSystem.from_records([record])
 
         result = system.get_best_k_completions("BE, OR")[0]
 
@@ -80,17 +77,16 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(result.offset, 7)
         self.assertEqual(result.score, 10)
 
-    def test_multiword_query_uses_posting_intersections(self):
+    def test_multiword_query_uses_suffix_array_candidates(self):
         records = [
             make_record(0, "How can I have this", "how can i have this"),
             make_record(1, "How things work", "how things work"),
             make_record(2, "I have this", "i have this"),
             make_record(3, "Completely unrelated", "completely unrelated"),
         ]
-        indexes = build_autocomplete_index_from_records(records)
-        system = AutoCompleteSystem(records, indexes)
+        system = AutoCompleteSystem.from_records(records)
 
-        candidate_ids = system._candidate_sentence_ids("how can i have")
+        candidate_ids = system.candidate_sentence_ids("how can i have")
         results = system.get_best_k_completions("how can i have")
 
         self.assertIn(0, candidate_ids)
