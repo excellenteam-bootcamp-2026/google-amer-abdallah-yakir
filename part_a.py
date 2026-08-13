@@ -4,13 +4,12 @@ import argparse
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Union
+import sys
+import time
+from typing import Iterable, List, Optional, Sequence, Union
 
-from autocomplete_index import (
-    AutocompleteIndex,
-    build_autocomplete_index_from_records,
-)
 from data_loader import SentenceRecord, iter_sentence_records, normalize_text
+from search import NativeSuffixArrayIndex, verify_one_edit_cpp
 
 
 PathLike = Union[str, Path]
@@ -158,10 +157,30 @@ class AutoCompleteSystem:
     def __init__(
         self,
         records: Sequence[SentenceRecord],
-        indexes: AutocompleteIndex,
+        search_index: NativeSuffixArrayIndex,
     ) -> None:
-        self.records = records
-        self.indexes = indexes
+        self.records = list(records)
+        self.search_index = search_index
+        if len(self.records) != len(self.search_index.normalized_sentences):
+            raise ValueError("The records and suffix-array sentences must align")
+        self.offline_metrics: dict[str, float | int] = {}
+        self.last_query_metrics: dict[str, float | int] = {}
+
+    @classmethod
+    def from_records(cls, records: Sequence[SentenceRecord]) -> "AutoCompleteSystem":
+        """Build the offline suffix array for already-loaded records."""
+        stored_records = list(records)
+        if any(not record.normalized_sentence for record in stored_records):
+            raise ValueError("Search records must have nonempty normalized sentences")
+        if any(
+            record.sentence_id != sentence_id
+            for sentence_id, record in enumerate(stored_records)
+        ):
+            raise ValueError("Sentence IDs must be contiguous and match record order")
+        search_index = NativeSuffixArrayIndex(
+            [record.normalized_sentence for record in stored_records]
+        )
+        return cls(records=stored_records, search_index=search_index)
 
     @classmethod
     def from_archive(
@@ -170,8 +189,9 @@ class AutoCompleteSystem:
         limit: Optional[int] = None,
         progress_every: Optional[int] = 100_000,
     ) -> "AutoCompleteSystem":
-        """Read the corpus and build the existing word/N-gram indexes."""
+        """Read the corpus and build the offline suffix-array index."""
 
+        load_started = time.perf_counter()
         source_records: Iterable[SentenceRecord] = iter_sentence_records(
             archive_path
         )
@@ -184,107 +204,73 @@ class AutoCompleteSystem:
             if progress_every and count % progress_every == 0:
                 print(f"Loaded {count:,} sentences...")
 
-        indexes = build_autocomplete_index_from_records(
-            records,
-            ngram_size=3,
-            progress_every=progress_every,
-        )
-        return cls(records=records, indexes=indexes)
+        load_seconds = time.perf_counter() - load_started
+        build_started = time.perf_counter()
+        system = cls.from_records(records)
+        build_seconds = time.perf_counter() - build_started
+        native_sizes = system.search_index.native_memory_breakdown
+        system.offline_metrics = {
+            "load_seconds": load_seconds,
+            "build_seconds": build_seconds,
+            "corpus_characters": len(system.search_index.corpus),
+            "corpus_bytes": sys.getsizeof(system.search_index.corpus),
+            **native_sizes,
+        }
+        return system
 
-    def _candidate_word_sentence_ids(self, word: str) -> Set[int]:
-        """Return sentence IDs for vocabulary words close to ``word``.
+    def candidate_sentence_ids(self, normalized_query: str) -> set[int]:
+        """Retrieve candidates only; verification and scoring remain separate."""
+        return self.search_index.find_approximate_candidates(normalized_query)
 
-        Exact words use their posting list immediately.  If a word is not in
-        the vocabulary, its character N-grams produce candidate words, which
-        are then verified with the same one-edit matcher used for sentences.
-        """
+    def _rank_sentence_ids(
+        self,
+        normalized_query: str,
+        sentence_ids: Iterable[int],
+        verify_candidates: bool,
+    ) -> List[AutoCompleteData]:
+        """Score valid records and apply the assignment's deterministic Top-5."""
+        best_results: List[AutoCompleteData] = []
 
-        exact_ids = self.indexes.get_sentence_ids(word)
-        if exact_ids:
-            return set(exact_ids)
-
-        if len(word) > 5:
-            grams = {
-                word[position : position + 3]
-                for position in range(len(word) - 2)
-            }
-            candidate_word_ids: Set[int] = set()
-            for gram in grams:
-                candidate_word_ids.update(
-                    self.indexes.word_ids_by_ngram.get(gram, ())
-                )
-        else:
-            # A short typo may share no trigram with its correction, so
-            # inspect the vocabulary. It is still much smaller than corpus.
-            candidate_word_ids = set(range(len(self.indexes.id_to_word)))
-
-        sentence_ids: Set[int] = set()
-        for word_id in candidate_word_ids:
-            candidate_word = self.indexes.get_word(word_id)
-            if best_match_score(word, candidate_word) is None:
+        for sentence_id in sentence_ids:
+            if not 0 <= sentence_id < len(self.records):
                 continue
-            sentence_ids.update(self.indexes.sentence_ids_by_word[word_id])
+            record = self.records[sentence_id]
 
-        return sentence_ids
-
-    def _candidate_sentence_ids(self, query: str) -> Optional[Set[int]]:
-        """Use the existing word postings to reduce sentence verification.
-
-        For a multiword query, intersect the posting groups.  We also create
-        leave-one-word-out intersections, because the assignment permits one
-        erroneous word.  ``None`` requests a correctness fallback over all
-        stored sentences when no word can provide an anchor.
-        """
-
-        words = query.split()
-        if not words:
-            return set()
-
-        word_sentence_ids = [
-            self._candidate_word_sentence_ids(word) for word in words
-        ]
-
-        if len(words) == 1:
-            return word_sentence_ids[0] or None
-
-        available_count = sum(bool(ids) for ids in word_sentence_ids)
-        if available_count == 0:
-            return None
-
-        candidates: Set[int] = set()
-
-        # Strict intersection: all query words occur in the sentence.
-        if available_count == len(words):
-            strict = set(word_sentence_ids[0])
-            for ids in word_sentence_ids[1:]:
-                strict.intersection_update(ids)
-            candidates.update(strict)
-
-        # For three or more words, at most one word may be wrong. Intersecting
-        # every group except one keeps the candidate set small and preserves
-        # sentences where that one word needs correction.
-        if len(words) >= 3:
-            for omitted_position in range(len(words)):
-                remaining_groups = [
-                    ids
-                    for position, ids in enumerate(word_sentence_ids)
-                    if position != omitted_position
-                ]
-                if not remaining_groups or any(not ids for ids in remaining_groups):
+            if verify_candidates:
+                verification = verify_one_edit_cpp(
+                    normalized_query, record.normalized_sentence
+                )
+                if not verification.matched:
                     continue
 
-                relaxed = set(remaining_groups[0])
-                for ids in remaining_groups[1:]:
-                    relaxed.intersection_update(ids)
-                candidates.update(relaxed)
+            score = best_match_score(
+                normalized_query, record.normalized_sentence
+            )
 
-        # With two words, use their intersection when possible.  If it is
-        # empty, the smaller posting list is the safest practical anchor.
-        elif not candidates:
-            nonempty_groups = [ids for ids in word_sentence_ids if ids]
-            candidates.update(min(nonempty_groups, key=len))
+            if score is None:
+                if verify_candidates:
+                    raise AssertionError(
+                        "C++ verifier accepted a candidate rejected by the "
+                        f"approved scorer: query={normalized_query!r}, "
+                        f"sentence={record.normalized_sentence!r}"
+                    )
+                continue
 
-        return candidates or None
+            result = AutoCompleteData(
+                completed_sentence=record.completed_sentence,
+                source_text=record.source_text,
+                offset=record.source_offset,
+                score=score,
+            )
+
+            if len(best_results) < 5:
+                best_results.append(result)
+                best_results.sort(key=_result_order)
+            elif _result_order(result) < _result_order(best_results[-1]):
+                best_results[-1] = result
+                best_results.sort(key=_result_order)
+
+        return best_results
 
     def get_best_k_completions(
         self,
@@ -296,40 +282,34 @@ class AutoCompleteSystem:
         if not query:
             return []
 
-        best_results: List[AutoCompleteData] = []
-        candidate_ids = self._candidate_sentence_ids(query)
+        query_started = time.perf_counter()
+        candidate_started = time.perf_counter()
+        candidate_ids = self.candidate_sentence_ids(query)
+        candidate_seconds = time.perf_counter() - candidate_started
+        ranking_started = time.perf_counter()
+        results = self._rank_sentence_ids(query, candidate_ids, verify_candidates=True)
+        ranking_seconds = time.perf_counter() - ranking_started
+        self.last_query_metrics = {
+            "candidate_count": len(candidate_ids),
+            "candidate_seconds": candidate_seconds,
+            "ranking_seconds": ranking_seconds,
+            "total_seconds": time.perf_counter() - query_started,
+        }
+        return results
 
-        if candidate_ids is None:
-            candidate_records: Iterable[SentenceRecord] = self.records
-        else:
-            candidate_records = (
-                self.records[sentence_id]
-                for sentence_id in candidate_ids
-                if 0 <= sentence_id < len(self.records)
-            )
-
-        for record in candidate_records:
-            score = best_match_score(query, record.normalized_sentence)
-            if score is None:
-                continue
-
-            result = AutoCompleteData(
-                completed_sentence=record.completed_sentence,
-                source_text=record.source_text,
-                offset=record.offset,
-                score=score,
-            )
-
-            if len(best_results) < 5:
-                best_results.append(result)
-                best_results.sort(key=_result_order)
-                continue
-
-            if _result_order(result) < _result_order(best_results[-1]):
-                best_results[-1] = result
-                best_results.sort(key=_result_order)
-
-        return best_results
+    def get_best_k_completions_brute_force(
+        self,
+        prefix: str,
+    ) -> List[AutoCompleteData]:
+        """Slow correctness oracle: score every record, then return exact Top-5."""
+        query = normalize_text(prefix)
+        if not query:
+            return []
+        return self._rank_sentence_ids(
+            query,
+            range(len(self.records)),
+            verify_candidates=False,
+        )
 
 
 _SYSTEM: Optional[AutoCompleteSystem] = None
@@ -407,6 +387,14 @@ def run_terminal(system: AutoCompleteSystem) -> None:
 
         print("Searching...")
         results = system.get_best_k_completions(current_text)
+        metrics = system.last_query_metrics
+        print(
+            "Online metrics: "
+            f"{metrics['total_seconds'] * 1000:.3f} ms total, "
+            f"{metrics['candidate_seconds'] * 1000:.3f} ms candidate lookup, "
+            f"{metrics['ranking_seconds'] * 1000:.3f} ms verify/rank, "
+            f"{metrics['candidate_count']:,} candidates."
+        )
 
         if not results:
             print("No matching sentences were found.")
@@ -442,11 +430,34 @@ def main() -> None:
     arguments = parser.parse_args()
 
     print("Loading files and preparing the system...")
-    system = initialize(arguments.archive, limit=arguments.limit)
+    try:
+        system = initialize(arguments.archive, limit=arguments.limit)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        parser.error(
+            f"{error}\n"
+            "Provide the corpus location with --archive, for example: "
+            "python part_a.py --archive C:\\path\\to\\Archive"
+        )
     print(
-        f"Loaded {len(system.records):,} sentences and "
-        f"{len(system.indexes.word_to_id):,} unique words."
+        f"Loaded {len(system.records):,} sentences; searchable corpus has "
+        f"{len(system.search_index.corpus):,} characters."
     )
+    metrics = system.offline_metrics
+    if metrics:
+        mib = 1024 ** 2
+        print(
+            "Offline metrics: "
+            f"load {metrics['load_seconds']:.3f} s, "
+            f"suffix-array build {metrics['build_seconds']:.3f} s."
+        )
+        print(
+            "Index sizes: "
+            f"corpus {metrics['corpus_bytes'] / mib:.1f} MiB, "
+            f"packed suffix array {metrics['suffix_array'] / mib:.1f} MiB, "
+            f"sentence starts {metrics['sentence_starts'] / mib:.1f} MiB, "
+            f"persistent native total {metrics['persistent_total'] / mib:.1f} MiB, "
+            f"estimated native build peak {metrics['build_peak'] / mib:.1f} MiB."
+        )
     run_terminal(system)
 
 

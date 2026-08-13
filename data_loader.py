@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Iterator, List, Union
 
 
@@ -16,33 +17,23 @@ class SentenceRecord:
     completed_sentence: str
     normalized_sentence: str
     source_text: str
-    offset: int
+    source_offset: int
 
 
 def normalize_text(text: str) -> str:
     """
-    Prepare text for searching and N-grams.
+    Prepare one shared searchable representation.
 
-    - Converts uppercase letters to lowercase.
-    - Replaces punctuation with spaces.
-    - Replaces multiple spaces with one space.
-    - Preserves letters and numbers.
+    Punctuation and symbols are removed rather than replaced so every runtime
+    component sees exactly the same searchable representation.
     """
 
-    normalized_characters = []
-    separator_pending = False
-
-    for character in text.casefold():
-        if character.isalnum():
-            if separator_pending and normalized_characters:
-                normalized_characters.append(" ")
-
-            normalized_characters.append(character)
-            separator_pending = False
-        else:
-            separator_pending = True
-
-    return "".join(normalized_characters)
+    searchable_characters = "".join(
+        character
+        for character in text.lower()
+        if character.isalnum() or character.isspace()
+    )
+    return re.sub(r"\s+", " ", searchable_characters).strip()
 
 
 def iter_text_files(root_directory: PathLike) -> Iterator[Path]:
@@ -119,7 +110,7 @@ def iter_sentence_records(
                     completed_sentence=completed_sentence,
                     normalized_sentence=normalized_sentence,
                     source_text=source_text,
-                    offset=offset,
+                    source_offset=offset,
                 )
 
                 sentence_id += 1
