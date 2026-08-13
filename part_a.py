@@ -10,6 +10,10 @@ from typing import Iterable, List, Optional, Sequence, Union
 
 from data_loader import SentenceRecord, iter_sentence_records, normalize_text
 from search import NativeSuffixArrayIndex, verify_one_edit_cpp
+import pickle
+from pathlib import Path as _Path
+from data_loader import iter_text_files
+from search.suffix_array import SuffixArrayIndex
 
 
 PathLike = Union[str, Path]
@@ -190,11 +194,38 @@ class AutoCompleteSystem:
         progress_every: Optional[int] = 100_000,
     ) -> "AutoCompleteSystem":
         """Read the corpus and build the offline suffix-array index."""
+        archive = _Path(archive_path).expanduser().resolve()
+
+        def _archive_signature(path: _Path) -> tuple[int, float]:
+            files = list(iter_text_files(path))
+            if not files:
+                return (0, 0.0)
+            mtimes = [f.stat().st_mtime for f in files]
+            return (len(files), max(mtimes))
+
+        cache_path = archive / ".autocomplete_cache.pkl"
+        desired_signature = _archive_signature(archive)
+
+        # Try loading from cache if present and signatures match. Only load
+        # cached data when the requested `limit` matches the cached `limit`.
+        if cache_path.exists():
+            try:
+                with cache_path.open("rb") as fh:
+                    cached = pickle.load(fh)
+                cached_limit = cached.get("limit")
+                if cached.get("signature") == desired_signature and cached_limit == limit:
+                    records = cached["records"]
+                    search_index = cached["search_index"]
+                    system = cls(records=records, search_index=search_index)
+                    system.offline_metrics = cached.get("offline_metrics", {})
+                    print("Loaded cached autocomplete index.")
+                    return system
+            except Exception:
+                # Fall back to rebuilding on any cache error.
+                pass
 
         load_started = time.perf_counter()
-        source_records: Iterable[SentenceRecord] = iter_sentence_records(
-            archive_path
-        )
+        source_records: Iterable[SentenceRecord] = iter_sentence_records(archive)
         if limit is not None:
             source_records = islice(source_records, limit)
 
@@ -205,17 +236,84 @@ class AutoCompleteSystem:
                 print(f"Loaded {count:,} sentences...")
 
         load_seconds = time.perf_counter() - load_started
+
+        # Prefer building the native C++ index (fast) when available, then
+        # extract a picklable Python `SuffixArrayIndex` from it so future
+        # runs can reuse the cached Python object. Fall back to the pure-
+        # Python builder if the native extension isn't present or extraction
+        # fails.
         build_started = time.perf_counter()
-        system = cls.from_records(records)
-        build_seconds = time.perf_counter() - build_started
-        native_sizes = system.search_index.native_memory_breakdown
+        search_index = None
+        build_seconds = 0.0
+        try:
+            # Try native build first (fast C++ implementation).
+            native_index = NativeSuffixArrayIndex([r.normalized_sentence for r in records])
+            native_build_seconds = time.perf_counter() - build_started
+
+            # Extract a Python-compatible SuffixArrayIndex without doing the
+            # expensive Python sort: construct an instance and populate its
+            # internal arrays from the native index (calls into C for suffixes).
+            extract_started = time.perf_counter()
+            py_index = SuffixArrayIndex.__new__(SuffixArrayIndex)
+            normalized_sentences = [r.normalized_sentence for r in records]
+            # compute sentence starts and corpus like the Python constructor
+            sentence_starts: List[int] = []
+            corpus_parts: List[str] = []
+            next_start = 0
+            for sentence in normalized_sentences:
+                sentence_starts.append(next_start)
+                corpus_parts.append(sentence)
+                next_start += len(sentence) + 1
+            py_index.normalized_sentences = normalized_sentences
+            py_index.sentence_starts = sentence_starts
+            py_index.corpus = "\0".join(corpus_parts)
+
+            # Retrieve the native suffix array positions into a Python list.
+            suffix_count = native_index.suffix_count
+            suffix_array: List[int] = [native_index.suffix_at(i) for i in range(suffix_count)]
+            py_index.suffix_array = suffix_array
+            extract_seconds = time.perf_counter() - extract_started
+
+            build_seconds = native_build_seconds + extract_seconds
+            search_index = py_index
+        except Exception:
+            # Native build/extraction failed; fall back to Python implementation.
+            build_started = time.perf_counter()
+            search_index = SuffixArrayIndex([r.normalized_sentence for r in records])
+            build_seconds = time.perf_counter() - build_started
+
+        system = cls(records=records, search_index=search_index)
+
+        # Estimate memory/metric sizes (best-effort).
+        native_sizes = getattr(search_index, "native_memory_breakdown", lambda: {})()
+
         system.offline_metrics = {
             "load_seconds": load_seconds,
             "build_seconds": build_seconds,
-            "corpus_characters": len(system.search_index.corpus),
-            "corpus_bytes": sys.getsizeof(system.search_index.corpus),
+            "corpus_characters": len(search_index.corpus),
+            "corpus_bytes": sys.getsizeof(search_index.corpus),
             **native_sizes,
         }
+
+        # Save cache for next runs; include the `limit` used so partial builds
+        # are not accidentally reused for full runs.
+        try:
+            with cache_path.open("wb") as fh:
+                pickle.dump(
+                    {
+                        "signature": desired_signature,
+                        "limit": limit,
+                        "records": records,
+                        "search_index": search_index,
+                        "offline_metrics": system.offline_metrics,
+                    },
+                    fh,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            print(f"Wrote autocomplete cache to {cache_path}")
+        except Exception:
+            pass
+
         return system
 
     def candidate_sentence_ids(self, normalized_query: str) -> set[int]:
