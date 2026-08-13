@@ -95,6 +95,34 @@ class SuffixArrayIndex:
             return None
         return sentence_id, match_offset
 
+    @property
+    def sentence_count(self) -> int:
+        return len(self.normalized_sentences)
+
+    @property
+    def suffix_count(self) -> int:
+        return len(self.suffix_array)
+
+    def suffix_at(self, index: int) -> int:
+        return self.suffix_array[index]
+
+    def native_memory_breakdown(self) -> dict[str, int]:
+        suffix_array = self.suffix_count * 4
+        sentence_starts = self.sentence_count * 4
+        build_workspace = self.suffix_count * 4 * 3
+        return {
+            "suffix_array": suffix_array,
+            "sentence_starts": sentence_starts,
+            "build_workspace": build_workspace,
+            "persistent_total": suffix_array + sentence_starts,
+            "build_peak": build_workspace,
+        }
+
+    def memory_bytes(self) -> tuple[int, int]:
+        persistent = self.suffix_count * 4 + self.sentence_count * 4
+        build_peak = self.suffix_count * 4 * 3
+        return (persistent, build_peak)
+
     def find_exact_occurrences(self, normalized_pattern: str) -> list[Occurrence]:
         """Find exact occurrences through binary search over sorted suffixes."""
         if not normalized_pattern or self.separator in normalized_pattern:
