@@ -7,6 +7,7 @@ from itertools import islice
 from pathlib import Path
 import random
 import statistics
+import sys
 import time
 import tracemalloc
 
@@ -54,19 +55,24 @@ def generate_queries(
 
 
 def benchmark_size(archive: Path, sentence_limit: int, query_count: int) -> int:
+    offline_started = time.perf_counter()
+    tracemalloc.start()
     load_started = time.perf_counter()
     records = list(islice(iter_sentence_records(archive), sentence_limit))
     load_seconds = time.perf_counter() - load_started
+    records_current, records_peak = tracemalloc.get_traced_memory()
     if not records:
         raise ValueError(f"No searchable records found under {archive}")
 
-    tracemalloc.start()
     build_started = time.perf_counter()
     system = AutoCompleteSystem.from_records(records)
     build_seconds = time.perf_counter() - build_started
     current_memory, peak_memory = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+    offline_seconds = time.perf_counter() - offline_started
     native_current, native_peak = system.search_index.native_memory_bytes
+    native_sizes = system.search_index.native_memory_breakdown
+    corpus_bytes = sys.getsizeof(system.search_index.corpus)
 
     queries = generate_queries(records, query_count)
     total_times: list[float] = []
@@ -118,26 +124,35 @@ def benchmark_size(archive: Path, sentence_limit: int, query_count: int) -> int:
 
     average_candidates = statistics.fmean(candidate_counts)
     reduction = 100 * (1 - average_candidates / len(records))
+    percentile_95 = sorted(total_times)[max(0, int(len(total_times) * 0.95) - 1)]
     print(f"Dataset: {len(records):,} actual records (limit {sentence_limit:,})")
-    print(f"Load time: {load_seconds:.3f} s")
-    print(f"Normalized corpus length: {len(system.search_index.corpus):,}")
-    print(f"Suffix-array build time: {build_seconds:.3f} s")
+    print("OFFLINE")
+    print(f"  Load/build/total: {load_seconds:.3f}/{build_seconds:.3f}/{offline_seconds:.3f} s")
+    print(f"  Normalized corpus: {len(system.search_index.corpus):,} characters, "
+          f"{corpus_bytes / 1024**2:.1f} MiB Python storage")
+    print(f"  Packed suffix array: {native_sizes['suffix_array'] / 1024**2:.1f} MiB")
+    print(f"  Sentence starts: {native_sizes['sentence_starts'] / 1024**2:.1f} MiB")
+    print(f"  Temporary native build workspace: {native_sizes['build_workspace'] / 1024**2:.1f} MiB")
     print(
-        "Index traced memory current/peak: "
-        f"{current_memory / 1024**2:.1f}/{peak_memory / 1024**2:.1f} MiB"
+        "  Python traced memory after load/current/peak: "
+        f"{records_current / 1024**2:.1f}/{current_memory / 1024**2:.1f}/"
+        f"{peak_memory / 1024**2:.1f} MiB"
     )
     print(
-        "Index native memory current/estimated build peak: "
+        "  Native persistent/estimated build peak: "
         f"{native_current / 1024**2:.1f}/{native_peak / 1024**2:.1f} MiB"
     )
-    print(f"Queries: {len(queries)}; differential queries: {differential_count}")
-    print(f"Average/median latency: {statistics.fmean(total_times) * 1000:.3f}/"
-          f"{statistics.median(total_times) * 1000:.3f} ms")
-    print(f"Average candidates: {average_candidates:.1f}")
-    print(f"Candidate reduction: {reduction:.1f}%")
-    print(f"Candidate retrieval: {statistics.fmean(candidate_times) * 1000:.3f} ms")
-    print(f"C++ verification: {statistics.fmean(verifier_times) * 1000:.3f} ms")
-    print(f"Scoring: {statistics.fmean(scoring_times) * 1000:.3f} ms\n")
+    print(f"  Combined estimated peak (Python traced + native): "
+          f"{(peak_memory + native_peak) / 1024**2:.1f} MiB")
+    print("ONLINE")
+    print(f"  Queries: {len(queries)}; differential queries: {differential_count}")
+    print(f"  Total latency avg/median/p95: {statistics.fmean(total_times) * 1000:.3f}/"
+          f"{statistics.median(total_times) * 1000:.3f}/{percentile_95 * 1000:.3f} ms")
+    print(f"  Candidate retrieval average: {statistics.fmean(candidate_times) * 1000:.3f} ms")
+    print(f"  C++ verification average: {statistics.fmean(verifier_times) * 1000:.3f} ms")
+    print(f"  Scoring average: {statistics.fmean(scoring_times) * 1000:.3f} ms")
+    print(f"  Average candidates: {average_candidates:.1f}")
+    print(f"  Candidate reduction: {reduction:.1f}%\n")
     return len(records)
 
 

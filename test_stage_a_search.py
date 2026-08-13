@@ -101,6 +101,17 @@ class SuffixArrayTests(unittest.TestCase):
         candidates = index.find_approximate_candidates("pxthon")
         self.assertIn(0, candidates)
 
+    def test_native_two_and_three_character_candidates_are_exact(self):
+        sentences = ["python", "jython", "at", "cat", "dog", "unrelated"]
+        native = NativeSuffixArrayIndex(sentences)
+        for query in ("py", "at", "ax", "cat", "cot", "ca", "dog"):
+            expected = {
+                sentence_id
+                for sentence_id, sentence in enumerate(sentences)
+                if verify_one_edit_python(query, sentence).matched
+            }
+            self.assertEqual(native.find_approximate_candidates(query), expected)
+
 
 class VerifierTests(unittest.TestCase):
     @classmethod

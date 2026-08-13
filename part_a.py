@@ -4,6 +4,8 @@ import argparse
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
+import sys
+import time
 from typing import Iterable, List, Optional, Sequence, Union
 
 from data_loader import SentenceRecord, iter_sentence_records, normalize_text
@@ -161,6 +163,8 @@ class AutoCompleteSystem:
         self.search_index = search_index
         if len(self.records) != len(self.search_index.normalized_sentences):
             raise ValueError("The records and suffix-array sentences must align")
+        self.offline_metrics: dict[str, float | int] = {}
+        self.last_query_metrics: dict[str, float | int] = {}
 
     @classmethod
     def from_records(cls, records: Sequence[SentenceRecord]) -> "AutoCompleteSystem":
@@ -187,6 +191,7 @@ class AutoCompleteSystem:
     ) -> "AutoCompleteSystem":
         """Read the corpus and build the offline suffix-array index."""
 
+        load_started = time.perf_counter()
         source_records: Iterable[SentenceRecord] = iter_sentence_records(
             archive_path
         )
@@ -199,7 +204,19 @@ class AutoCompleteSystem:
             if progress_every and count % progress_every == 0:
                 print(f"Loaded {count:,} sentences...")
 
-        return cls.from_records(records)
+        load_seconds = time.perf_counter() - load_started
+        build_started = time.perf_counter()
+        system = cls.from_records(records)
+        build_seconds = time.perf_counter() - build_started
+        native_sizes = system.search_index.native_memory_breakdown
+        system.offline_metrics = {
+            "load_seconds": load_seconds,
+            "build_seconds": build_seconds,
+            "corpus_characters": len(system.search_index.corpus),
+            "corpus_bytes": sys.getsizeof(system.search_index.corpus),
+            **native_sizes,
+        }
+        return system
 
     def candidate_sentence_ids(self, normalized_query: str) -> set[int]:
         """Retrieve candidates only; verification and scoring remain separate."""
@@ -265,8 +282,20 @@ class AutoCompleteSystem:
         if not query:
             return []
 
+        query_started = time.perf_counter()
+        candidate_started = time.perf_counter()
         candidate_ids = self.candidate_sentence_ids(query)
-        return self._rank_sentence_ids(query, candidate_ids, verify_candidates=True)
+        candidate_seconds = time.perf_counter() - candidate_started
+        ranking_started = time.perf_counter()
+        results = self._rank_sentence_ids(query, candidate_ids, verify_candidates=True)
+        ranking_seconds = time.perf_counter() - ranking_started
+        self.last_query_metrics = {
+            "candidate_count": len(candidate_ids),
+            "candidate_seconds": candidate_seconds,
+            "ranking_seconds": ranking_seconds,
+            "total_seconds": time.perf_counter() - query_started,
+        }
+        return results
 
     def get_best_k_completions_brute_force(
         self,
@@ -358,6 +387,14 @@ def run_terminal(system: AutoCompleteSystem) -> None:
 
         print("Searching...")
         results = system.get_best_k_completions(current_text)
+        metrics = system.last_query_metrics
+        print(
+            "Online metrics: "
+            f"{metrics['total_seconds'] * 1000:.3f} ms total, "
+            f"{metrics['candidate_seconds'] * 1000:.3f} ms candidate lookup, "
+            f"{metrics['ranking_seconds'] * 1000:.3f} ms verify/rank, "
+            f"{metrics['candidate_count']:,} candidates."
+        )
 
         if not results:
             print("No matching sentences were found.")
@@ -405,6 +442,22 @@ def main() -> None:
         f"Loaded {len(system.records):,} sentences; searchable corpus has "
         f"{len(system.search_index.corpus):,} characters."
     )
+    metrics = system.offline_metrics
+    if metrics:
+        mib = 1024 ** 2
+        print(
+            "Offline metrics: "
+            f"load {metrics['load_seconds']:.3f} s, "
+            f"suffix-array build {metrics['build_seconds']:.3f} s."
+        )
+        print(
+            "Index sizes: "
+            f"corpus {metrics['corpus_bytes'] / mib:.1f} MiB, "
+            f"packed suffix array {metrics['suffix_array'] / mib:.1f} MiB, "
+            f"sentence starts {metrics['sentence_starts'] / mib:.1f} MiB, "
+            f"persistent native total {metrics['persistent_total'] / mib:.1f} MiB, "
+            f"estimated native build peak {metrics['build_peak'] / mib:.1f} MiB."
+        )
     run_terminal(system)
 
 

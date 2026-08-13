@@ -183,6 +183,67 @@ static PyObject* exact_sentence_ids(PyObject*, PyObject* arguments) {
     return result;
 }
 
+static bool one_insertion_apart(
+    PyObject* shorter, Py_ssize_t shorter_start, Py_ssize_t shorter_length,
+    PyObject* longer, Py_ssize_t longer_start, Py_ssize_t longer_length
+) {
+    if (longer_length != shorter_length + 1) return false;
+    const int sk = PyUnicode_KIND(shorter), lk = PyUnicode_KIND(longer);
+    const void* sd = PyUnicode_DATA(shorter); const void* ld = PyUnicode_DATA(longer);
+    Py_ssize_t left = 0, right = 0; bool skipped = false;
+    while (left < shorter_length && right < longer_length) {
+        if (PyUnicode_READ(sk, sd, shorter_start + left) ==
+            PyUnicode_READ(lk, ld, longer_start + right)) { ++left; ++right; }
+        else if (skipped) return false;
+        else { skipped = true; ++right; }
+    }
+    return true;
+}
+
+static bool sentence_matches_one_edit(
+    const NativeIndex* index, uint32_t sentence_id, PyObject* query
+) {
+    const uint32_t start = index->sentence_starts[sentence_id];
+    const uint32_t end = sentence_id + 1 < index->sentence_starts.size()
+        ? index->sentence_starts[sentence_id + 1] - 1
+        : static_cast<uint32_t>(PyUnicode_GET_LENGTH(index->corpus));
+    const Py_ssize_t sentence_length = end - start;
+    const Py_ssize_t query_length = PyUnicode_GET_LENGTH(query);
+    const int ck = PyUnicode_KIND(index->corpus), qk = PyUnicode_KIND(query);
+    const void* cd = PyUnicode_DATA(index->corpus); const void* qd = PyUnicode_DATA(query);
+    for (Py_ssize_t offset = 0; offset <= sentence_length; ++offset) {
+        if (offset + query_length <= sentence_length) {
+            int mismatches = 0;
+            for (Py_ssize_t i = 0; i < query_length && mismatches <= 1; ++i)
+                mismatches += PyUnicode_READ(qk, qd, i) != PyUnicode_READ(ck, cd, start + offset + i);
+            if (mismatches <= 1) return true;
+        }
+        if (query_length > 0 && offset + query_length - 1 <= sentence_length &&
+            one_insertion_apart(index->corpus, start + offset, query_length - 1, query, 0, query_length))
+            return true;
+        if (offset + query_length + 1 <= sentence_length &&
+            one_insertion_apart(query, 0, query_length, index->corpus, start + offset, query_length + 1))
+            return true;
+    }
+    return false;
+}
+
+static PyObject* one_edit_sentence_ids(PyObject*, PyObject* arguments) {
+    PyObject* capsule; PyObject* query;
+    if (!PyArg_ParseTuple(arguments, "OU", &capsule, &query)) return nullptr;
+    NativeIndex* index = get_index(capsule); if (index == nullptr) return nullptr;
+    PyObject* result = PySet_New(nullptr); if (result == nullptr) return nullptr;
+    for (uint32_t sentence_id = 0; sentence_id < index->sentence_starts.size(); ++sentence_id) {
+        if (!sentence_matches_one_edit(index, sentence_id, query)) continue;
+        PyObject* value = PyLong_FromUnsignedLong(sentence_id);
+        if (value == nullptr || PySet_Add(result, value) < 0) {
+            Py_XDECREF(value); Py_DECREF(result); return nullptr;
+        }
+        Py_DECREF(value);
+    }
+    return result;
+}
+
 static PyObject* corpus(PyObject*, PyObject* capsule) {
     NativeIndex* index = get_index(capsule); if (index == nullptr) return nullptr;
     return Py_NewRef(index->corpus);
@@ -213,15 +274,34 @@ static PyObject* memory_bytes(PyObject*, PyObject* capsule) {
         static_cast<unsigned long long>(persistent),
         static_cast<unsigned long long>(index->build_peak_native_bytes));
 }
+static PyObject* memory_breakdown(PyObject*, PyObject* capsule) {
+    NativeIndex* index = get_index(capsule); if (index == nullptr) return nullptr;
+    const uint64_t suffix_array =
+        static_cast<uint64_t>(index->suffix_array.capacity()) * sizeof(uint32_t);
+    const uint64_t sentence_starts =
+        static_cast<uint64_t>(index->sentence_starts.capacity()) * sizeof(uint32_t);
+    const uint64_t build_workspace =
+        static_cast<uint64_t>(index->suffix_array.size()) * sizeof(uint32_t) * 3;
+    return Py_BuildValue(
+        "{s:K,s:K,s:K,s:K,s:K}",
+        "suffix_array", static_cast<unsigned long long>(suffix_array),
+        "sentence_starts", static_cast<unsigned long long>(sentence_starts),
+        "build_workspace", static_cast<unsigned long long>(build_workspace),
+        "persistent_total", static_cast<unsigned long long>(suffix_array + sentence_starts),
+        "build_peak", static_cast<unsigned long long>(index->build_peak_native_bytes)
+    );
+}
 
 static PyMethodDef methods[] = {
     {"build", (PyCFunction)build, METH_O, "Build a packed native suffix array."},
     {"exact_sentence_ids", exact_sentence_ids, METH_VARARGS, "Return exact matching sentence IDs."},
+    {"one_edit_sentence_ids", one_edit_sentence_ids, METH_VARARGS, "Return sentence IDs matching within one edit."},
     {"corpus", (PyCFunction)corpus, METH_O, "Return the retained corpus."},
     {"sentence_count", (PyCFunction)sentence_count, METH_O, "Return sentence count."},
     {"suffix_count", (PyCFunction)suffix_count, METH_O, "Return suffix count."},
     {"suffix_at", suffix_at, METH_VARARGS, "Return one suffix position for tests."},
     {"memory_bytes", (PyCFunction)memory_bytes, METH_O, "Return persistent and peak native bytes."},
+    {"memory_breakdown", (PyCFunction)memory_breakdown, METH_O, "Return native allocation sizes."},
     {nullptr, nullptr, 0, nullptr},
 };
 static PyModuleDef module = {PyModuleDef_HEAD_INIT, "_suffix_array_cpp", nullptr, -1, methods};

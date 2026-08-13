@@ -31,6 +31,23 @@ class NativeSuffixArrayIndex:
         """Return persistent and estimated peak native allocation bytes."""
         return _suffix_array_cpp.memory_bytes(self._native)
 
+    @property
+    def native_memory_breakdown(self) -> dict[str, int]:
+        """Return byte sizes for the packed index and temporary build arrays."""
+        if hasattr(_suffix_array_cpp, "memory_breakdown"):
+            return _suffix_array_cpp.memory_breakdown(self._native)
+        suffix_array = self.suffix_count * 4
+        sentence_starts = self.sentence_count * 4
+        build_workspace = self.suffix_count * 4 * 3
+        _, build_peak = self.native_memory_bytes
+        return {
+            "suffix_array": suffix_array,
+            "sentence_starts": sentence_starts,
+            "build_workspace": build_workspace,
+            "persistent_total": suffix_array + sentence_starts,
+            "build_peak": build_peak,
+        }
+
     def suffix_at(self, index: int) -> int:
         """Expose one position for correctness tests without materializing the SA."""
         return _suffix_array_cpp.suffix_at(self._native, index)
@@ -41,8 +58,12 @@ class NativeSuffixArrayIndex:
         return _suffix_array_cpp.exact_sentence_ids(self._native, normalized_pattern)
 
     def find_approximate_candidates(self, normalized_query: str) -> set[int]:
-        if len(normalized_query) < 3:
+        if len(normalized_query) < 2:
             return set(range(self.sentence_count))
+        if len(normalized_query) <= 3:
+            return _suffix_array_cpp.one_edit_sentence_ids(
+                self._native, normalized_query
+            )
         split = len(normalized_query) // 2
         return self.find_exact_sentence_ids(
             normalized_query[:split]
